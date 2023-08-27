@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+#
+# This file is part of the Robotic Observatory Control Kit (rockit)
+#
+# rockit is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rockit is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rockit.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon for controlling a 16" Meade LX200-GPS via Pyro"""
+
+import argparse
+import queue
+import re
+import sys
+import threading
+import time
+import traceback
+from astropy.coordinates import Angle, FK5, ICRS, SkyCoord, EarthLocation, get_moon, get_sun
+from astropy.time import Time
+import astropy.units as u
+import serial
+import Pyro4
+
+from rockit.common import log, TryLock
+from rockit.common.helpers import pyro_client_matches
+from rockit.meade import CommandStatus, Config, TelescopeState
+
+SEXAGESIMAL_REGEX = re.compile(rb'^(?P<unit>[+-]?\d+)(?P<type>[:\xDF])(?P<minutes>\d+):(?P<seconds>\d+)$')
+
+
+def command_without_response(port, command):
+    port.flushInput()
+    port.write(f':{command}#'.encode('ascii'))
+
+
+def command_with_response(port, command, response_length):
+    port.flushInput()
+    port.write(f':{command}#'.encode('ascii'))
+    return port.read(response_length)
+
+
+def command_with_bool_response(port, command):
+    port.flushInput()
+    port.write(f':{command}#'.encode('ascii'))
+    while True:
+        char = port.read(1)
+        if char == b'\x15':
+            # Telescope is busy, wait and retry
+            time.sleep(1)
+            print(f'DEBUG: retrying :{command}#')
+            port.write(f':{command}#'.encode('ascii'))
+        else:
+            return char == b'1'
+
+
+def command_with_string_response(port, command):
+    port.flushInput()
+    port.write(f':{command}#'.encode('ascii'))
+    response = []
+    while True:
+        char = port.read(1)
+        if char == b'\x15' and not response:
+            # Telescope is busy, wait and retry
+            time.sleep(1)
+            print(f'DEBUG: retrying :{command}#')
+            port.write(f':{command}#'.encode('ascii'))
+
+        if char == b'#':
+            return b''.join(response)
+
+        response.append(char)
+
+
+def sexagesimal_to_degrees(source):
+    match = SEXAGESIMAL_REGEX.match(source)
+    if not match:
+        raise ValueError(f'{source} is not a sexagesimal string')
+
+    unit = float(match.group('unit'))
+    sign = -1 if match.group('unit')[0:1] == b'-' else 1
+
+    value = unit + sign * float(match.group('minutes')) / 60. + sign * float(match.group('seconds')) / 3600.
+    if match.group('type') == b':':
+        value *= 15
+
+    return value
+
+
+class MeadeDaemon:
+    """Daemon interface for talon subsystems"""
+    def __init__(self, config):
+        self._config = config
+        self._location = EarthLocation(
+            lat=config.latitude*u.deg,
+            lon=config.longitude*u.deg,
+            height=config.altitude*u.m)
+
+        self._ha_positive_limit = self._config.ha_soft_limits[1] * u.deg
+        self._ha_negative_limit = self._config.ha_soft_limits[0] * u.deg
+        self._dec_positive_limit = self._config.dec_soft_limits[1] * u.deg
+        self._dec_negative_limit = self._config.dec_soft_limits[0] * u.deg
+
+        self._initializing = False
+        self._force_stopped = False
+
+        self._command_lock = threading.Lock()
+
+        self._comm_lock = threading.Lock()
+        self._command_queue = queue.Queue()
+        self._result_queue = queue.Queue()
+        self._move_complete_condition = threading.Condition()
+        self._port = None
+
+        self._state_lock = threading.Lock()
+        self._current_state = None
+
+        threading.Thread(target=self.__run, daemon=True).start()
+
+    def _initialize(self):
+        """
+        Opens the serial connection and negotiate initialization handshake
+        This may take a minute or two to return.
+        Returns CommandStatus reflecting result
+        """
+        if self._port is not None:
+            return CommandStatus.NotDisconnected
+
+        try:
+            self._initializing = True
+            port = serial.Serial(self._config.serial_port,
+                                 self._config.serial_baud,
+                                 timeout=self._config.serial_timeout)
+            log.info(self._config.log_name, 'connected to mount')
+
+            # Flush any stale state
+            port.flushInput()
+            port.flushOutput()
+
+            # Reboot mount
+            print('Rebooting mount')
+            command_without_response(port, 'I')
+
+            # Wait for mount to respond
+            initialize_start = Time.now()
+
+            while True:
+                port.write(b'\x06')
+                response = port.read(1)
+                if len(response) > 0:
+                    if response not in [b'L', b'P']:
+                        raise serial.SerialException('Mount is not in Polar mode')
+                    break
+
+                if (Time.now() - initialize_start) > self._config.initialize_timeout * u.s:
+                    raise serial.SerialException('Mount initialization timed out')
+                time.sleep(5)
+
+            time.sleep(1)
+            port.flushInput()
+            print('Connected to mount')
+
+            # Wait for worm gear to find its home position
+            print('Waiting for Smart Drive to initialize')
+            while True:
+                if (Time.now() - initialize_start) > self._config.initialize_timeout * u.s:
+                    raise serial.SerialException('Mount initialization timed out')
+
+                if b'Smart Drive' not in command_with_string_response(port, 'ED'):
+                    break
+
+                time.sleep(5)
+
+            # Send current time (bypasses the daylight savings prompt on the hand box)
+            # Note that this isn't applied until after the Smart Drive has initialized
+            ret = command_with_bool_response(port, f'hI{Time.now().strftime("%y%m%d%H%M%S")}')
+            if not ret:
+                raise serial.SerialException('Failed to set current time')
+
+            # Validate site location and time
+            latitude = sexagesimal_to_degrees(command_with_string_response(port, 'Gt'))
+            latitude_delta = latitude - self._location.lat.to_value(u.deg)
+
+            # Note: Mount returns western longitudes as positive(!)
+            longitude = -sexagesimal_to_degrees(command_with_string_response(port, 'Gg'))
+            longitude_delta = longitude - self._location.lon.to_value(u.deg)
+
+            lst = sexagesimal_to_degrees(command_with_string_response(port, 'GS')) * u.deg
+            lst_delta = ((lst - Time(Time.now(), location=self._location).sidereal_time('apparent'))
+                         .wrap_at(180*u.deg)).to_value(u.deg)
+
+            if abs(latitude_delta) > 0.5:
+                raise ValueError(f'Latitude does not match expected site location (delta is {latitude_delta} deg)')
+            if abs(longitude_delta) > 0.5:
+                raise ValueError(f'Longitude does not match expected site location (delta is {longitude_delta} deg)')
+            if abs(lst_delta) > 0.16667:
+                raise ValueError(f'LST does not match expected site location (delta is {lst_delta} deg)')
+
+            self._port = port
+            self._set_tracking(False)
+
+            # Refresh state before considering the connection valid
+            self._update_state()
+
+            log.info(self._config.log_name, 'initialization complete')
+            return CommandStatus.Succeeded
+        except Exception as e:
+            print('Failed to communicate with telescope')
+            traceback.print_exc(file=sys.stdout)
+            if self._port is not None:
+                self._port.close()
+                self._port = None
+
+            print('is valueerror', isinstance(e, ValueError))
+            return CommandStatus.InvalidMountConfiguration if isinstance(e, ValueError) else CommandStatus.Failed
+        finally:
+            self._initializing = False
+
+    def _set_tracking(self, enabled):
+        # Enable or disable sidereal tracking
+        # by switching the mount between Polar and Land mode.
+        # This may take multiple attempts to succeed
+        desired = b'T' if enabled else b'N'
+        command = 'AP' if enabled else 'AL'
+        while True:
+            alignment = command_with_response(self._port, 'GW', 3)
+            if alignment[1:2] == desired:
+                break
+            command_without_response(self._port, command)
+            time.sleep(1)
+
+    def _shutdown(self):
+        """
+        Sends a telescope park command and closes the serial connection
+        Returns CommandStatus reflecting result
+        """
+        with self._state_lock:
+            if self._port is None:
+                return CommandStatus.NotConnected
+
+            try:
+                if self._port is not None:
+                    # Slew to park position so mount remembers position
+                    command_without_response(self._port, 'hP')
+                    self._port.close()
+                    self._port = None
+                return CommandStatus.Succeeded
+            except Exception as exception:
+                print(f'Failed to close serial port ({exception})')
+                self._port = None
+                return CommandStatus.Failed
+
+    def _update_state(self):
+        """Request and parse telescope state"""
+        data = None
+        state = TelescopeState.Disabled
+        if self._port is not None:
+            update_time = Time.now()
+
+            alt = sexagesimal_to_degrees(command_with_string_response(self._port, 'GA'))
+            az = sexagesimal_to_degrees(command_with_string_response(self._port, 'GZ'))
+            lst = sexagesimal_to_degrees(command_with_string_response(self._port, 'GS'))
+
+            if command_with_string_response(self._port, 'D'):
+                state = TelescopeState.Slewing
+
+                # Reported RA,Dec are incorrect when slewing, so calculate from Alt, Az
+                coords_j2000 = SkyCoord(alt=alt, az=az, unit=u.deg, frame='altaz',
+                                        location=self._location, obstime=update_time).icrs
+            else:
+                alignment = command_with_response(self._port, 'GW', 3)
+                state = TelescopeState.Tracking if alignment[1:2] == b'T' else TelescopeState.Stopped
+                ra_jnow = sexagesimal_to_degrees(command_with_string_response(self._port, 'GR'))
+                dec_jnow = sexagesimal_to_degrees(command_with_string_response(self._port, 'GD'))
+                coords_jnow = SkyCoord(ra=ra_jnow, dec=dec_jnow, unit=u.deg, frame=FK5(equinox=update_time))
+                coords_j2000 = coords_jnow.transform_to(ICRS)
+
+            data = {
+                'date': update_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+                'state': state,
+                'state_label': TelescopeState.label(state),
+                'lst': lst,
+                'ra': coords_j2000.ra.to_value(u.deg),
+                'dec': coords_j2000.dec.to_value(u.deg),
+                'alt': alt,
+                'az': az,
+
+                'site_latitude': self._location.lat.to_value(u.deg),
+                'site_longitude': self._location.lon.to_value(u.deg),
+                'site_elevation': self._location.height.to_value(u.m),
+            }
+
+            data.update({
+                'moon_separation': get_moon(update_time).separation(coords_j2000).to_value(u.deg),
+                'sun_separation': get_sun(update_time).separation(coords_j2000).to_value(u.deg),
+            })
+
+        with self._state_lock:
+            was_slewing = False
+            if self._current_state is not None:
+                was_slewing = self._current_state['state'] == TelescopeState.Slewing
+            is_slewing = state == TelescopeState.Slewing
+            self._current_state = data
+
+            if was_slewing and not is_slewing:
+                with self._move_complete_condition:
+                    self._move_complete_condition.notify_all()
+
+    def process_request(self, request, data):
+        """
+        Process a command sent by the user
+        Returns a CommandStatus that is pushed to the results queue
+        """
+        if self._port is None:
+            return CommandStatus.NotConnected
+
+        if request == 'stop':
+            self._force_stopped = True
+            command_without_response(self._port, 'Q')
+            time.sleep(1)
+            self._set_tracking(False)
+            with self._move_complete_condition:
+                self._move_complete_condition.notify_all()
+
+        elif request == 'track':
+            coords = data.transform_to(FK5(equinox=data.obstime))
+            ra = coords.ra.to(u.hourangle).to_string(sep=":", precision=0, pad=True)
+            dec = coords.dec.to(u.deg).to_string(sep="*:", precision=0, alwayssign=True, pad=True)
+
+            if not command_with_bool_response(self._port, f'Sr{ra}'):
+                return CommandStatus.Failed
+
+            if not command_with_bool_response(self._port, f'Sd{dec}'):
+                return CommandStatus.Failed
+
+            # Slew to target coordinates with sidereal tracking
+            ret = command_with_response(self._port, 'MS', 1)
+            if ret != b'0':
+                self._port.read_until('#')
+                return CommandStatus.Failed
+
+            return CommandStatus.Succeeded
+        elif request == 'slew':
+            # 'MA' command assumes that the telescope is mounted altaz
+            # For an equatorial mount this maps from
+            #    Altitude -> Dec
+            #    Azimuth -> 180 + HA
+            # Adjust coordinates to suit
+            coords = data.transform_to(FK5(equinox=data.obstime))
+            alt = coords.dec.to(u.deg).to_string(sep="*'", precision=0, alwayssign=True, pad=True)
+
+            lst = Time(data.obstime, location=data.location).sidereal_time('apparent')
+            az = (180 * u.deg + lst - coords.ra.to(u.deg)).wrap_at(360 * u.deg).to_value(u.deg)
+
+            az_deg = int(az)
+            az_min = int(60*(az - az_deg))
+
+            if not command_with_bool_response(self._port, f'Sa{alt}'):
+                return CommandStatus.Failed
+
+            if not command_with_bool_response(self._port, f'Sz{az_deg:03d}*{az_min:02d}'):
+                return CommandStatus.Failed
+
+            # Slew to target coordinates
+            ret = command_with_response(self._port, 'MA', 1)
+            if ret != b'0':
+                return CommandStatus.Failed
+
+            return CommandStatus.Succeeded
+        elif request == 'sync':
+            coords = data.transform_to(FK5(equinox=data.obstime))
+            ra = coords.ra.to(u.hourangle).to_string(sep=":", precision=0, pad=True)
+            dec = coords.dec.to(u.deg).to_string(sep="*:", precision=0, alwayssign=True, pad=True)
+
+            if not command_with_bool_response(self._port, f'Sr{ra}'):
+                return CommandStatus.Failed
+
+            if not command_with_bool_response(self._port, f'Sd{dec}'):
+                return CommandStatus.Failed
+
+            # Sync to target coordinates
+            ret = command_with_string_response(self._port, 'CM')
+            if ret != b"   M31    EX GAL MAG 3.5 SZ178.0'":
+                return CommandStatus.Failed
+
+        elif request == 'zero':
+            # Set target coordinates to match the zero markers (HA = DEC = 0)
+            lst = Angle((self._current_state['lst'] * u.deg).to(u.hourangle)).to_string(sep=":", precision=0, pad=True)
+            if not command_with_bool_response(self._port, f'Sr{lst}'):
+                return CommandStatus.Failed
+
+            if not command_with_bool_response(self._port, 'Sd+00*00:00'):
+                return CommandStatus.Failed
+
+            # Sync to target coordinates
+            ret = command_with_string_response(self._port, 'CM')
+            if ret != b"   M31    EX GAL MAG 3.5 SZ178.0'":
+                return CommandStatus.Failed
+
+            # Sidereal tracking restarts a few seconds after syncing
+            time.sleep(5)
+            self._set_tracking(False)
+
+            # Set park position
+            command_without_response(self._port, 'hS')
+            log.info(self._config.log_name, 'mount zeroed')
+        else:
+            print(f'Unknown request `{request}`')
+            return CommandStatus.Failed
+
+        return CommandStatus.Succeeded
+
+    def __run(self):
+        """Background thread managing communication over the serial connection"""
+        delay = self._config.idle_loop_delay
+        while True:
+            try:
+                request, data = self._command_queue.get(timeout=delay)
+            except queue.Empty:
+                request, data = None, None
+
+            if request == 'initialize':
+                self._result_queue.put(self._initialize())
+                continue
+
+            if request == 'shutdown':
+                self._result_queue.put(self._shutdown())
+                continue
+
+            result = CommandStatus.NotConnected
+            try:
+                self._update_state()
+
+                if request is not None:
+                    result = self.process_request(request, data)
+                    self._update_state()
+
+                if self._current_state and self._current_state['state'] == TelescopeState.Slewing:
+                    delay = self._config.slew_loop_delay
+                else:
+                    delay = self._config.idle_loop_delay
+            except Exception as exception:
+                with self._state_lock:
+                    if self._port is not None:
+                        self._port.close()
+                        self._port = None
+
+                print(f'Failed to issue command ({exception})')
+                log.error(self._config.log_name, 'Lost serial connection')
+                traceback.print_exc(file=sys.stdout)
+            finally:
+                if request is not None:
+                    self._result_queue.put(result)
+
+    def _validate_pointing(self, coords, log_failed_prefix):
+        """
+        Check whether the given coordinate is within our soft HA and Dec limits.
+        Returns CommandStatus.Succeeded if valid, otherwise logs and returns the appropriate error status
+        """
+        icrs = coords.icrs
+        lst = Time(coords.obstime, location=coords.location).sidereal_time('apparent')
+        ha = (lst - icrs.ra).wrap_at(12 * u.hourangle)
+        dec = icrs.dec
+
+        if ha < self._ha_negative_limit or ha > self._ha_positive_limit:
+            log.error(self._config.log_name, log_failed_prefix + f'; ha {ha} outside limit ' +
+                      f'({self._ha_negative_limit}, {self._ha_positive_limit})')
+            return CommandStatus.OutsideHALimits
+
+        if dec < self._dec_negative_limit or dec > self._dec_positive_limit:
+            log.error(self._config.log_name, log_failed_prefix + f'; dec {dec} outside limit ' +
+                      f'({self._dec_negative_limit}, {self._dec_positive_limit})')
+            return CommandStatus.OutsideDecLimits
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def report_status(self):
+        """Returns a dictionary containing the current telescope state"""
+        with self._state_lock:
+            data = self._current_state
+
+        if data is None:
+            state = TelescopeState.Initializing if self._initializing else TelescopeState.Disabled
+            data = {
+                'date': Time.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+                'state': state,
+                'state_label': TelescopeState.label(state)
+            }
+
+        return data
+
+    @Pyro4.expose
+    def initialize(self):
+        """Connect to mount and enable motor power"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            with self._comm_lock:
+                self._command_queue.put(('initialize', None))
+                return self._result_queue.get()
+
+    @Pyro4.expose
+    def stop(self):
+        """Stops any active telescope movement"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._state_lock:
+            if self._current_state is None:
+                return CommandStatus.NotConnected
+
+        with self._comm_lock:
+            self._command_queue.put(('stop', None))
+            self._result_queue.get()
+
+        # Block until any other pointing commands have terminated before cleaning up
+        with self._command_lock:
+            self._force_stopped = False
+
+        return CommandStatus.Succeeded
+
+    def _point(self, coords, tracking=False):
+        """Moves the telescope to a specified SkyCoord and optionally begins tracking"""
+
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            with self._state_lock:
+                if self._current_state is None:
+                    return CommandStatus.NotConnected
+
+            with self._comm_lock:
+                self._command_queue.put(('track' if tracking else 'slew', coords))
+                status = self._result_queue.get()
+                if status != CommandStatus.Succeeded:
+                    return status
+
+            start = Time.now()
+            with self._move_complete_condition:
+                while True:
+                    # Note: it can take a second before the slew begins
+                    # Wait an interval period so we don't exit too early
+                    self._move_complete_condition.wait(self._config.slew_loop_delay)
+
+                    if self._force_stopped:
+                        break
+
+                    with self._state_lock:
+                        if self._current_state.get('state', TelescopeState.Disabled) != TelescopeState.Slewing:
+                            break
+
+                    if (Time.now() - start).to_value(u.s) > self._config.slew_timeout:
+                        break
+
+                if self._force_stopped:
+                    log.error(self._config.log_name, 'Pointing failed: aborted')
+                    return CommandStatus.Failed
+
+                return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def track_radec(self, ra_deg, dec_deg):
+        """Moves the telescope to a specified J2000 ra, dec and track at the sidereal rate"""
+        coords = SkyCoord(
+            ra=ra_deg * u.deg,
+            dec=dec_deg * u.deg,
+            frame='icrs',
+            obstime=Time(Time.now(), location=self._location))
+
+        # Check against telescope limits
+        valid_status = self._validate_pointing(coords, f'failed to move to ra {ra_deg} dec {dec_deg}')
+        if valid_status != CommandStatus.Succeeded:
+            return valid_status
+
+        return self._point(coords, True)
+
+    @Pyro4.expose
+    def offset_radec(self, ra_delta_deg, dec_delta_deg):
+        """Offsets the telescope relative to the current position"""
+        # TODO
+        return CommandStatus.Failed
+
+    @Pyro4.expose
+    def slew_radec(self, ra_deg, dec_deg):
+        """Moves the telescope to a specified J2000 ra, dec"""
+        coords = SkyCoord(
+            ra=ra_deg * u.deg,
+            dec=dec_deg * u.deg,
+            frame='icrs',
+            obstime=Time(Time.now(), location=self._location))
+
+        # Check against telescope limits
+        valid_status = self._validate_pointing(coords, f'failed to move to ra {ra_deg} dec {dec_deg}')
+        if valid_status != CommandStatus.Succeeded:
+            return valid_status
+
+        return self._point(coords, False)
+
+    @Pyro4.expose
+    def slew_altaz(self, alt_deg, az_deg):
+        """Moves the telescope to a specified alt, az"""
+        coords = SkyCoord(
+            alt=alt_deg,
+            az=az_deg,
+            unit=u.deg,
+            frame='altaz',
+            location=self._location,
+            obstime=Time.now())
+
+        # Check against telescope limits
+        valid_status = self._validate_pointing(coords, f'failed to move to alt {alt_deg} az {az_deg}')
+        if valid_status != CommandStatus.Succeeded:
+            return valid_status
+        return self._point(coords, False)
+
+    @Pyro4.expose
+    def sync(self, ra_deg, dec_deg):
+        """Sync the telescope position on a sky position"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            with self._state_lock:
+                if self._current_state is None:
+                    return CommandStatus.NotConnected
+
+            with self._comm_lock:
+                self._command_queue.put(('sync', SkyCoord(ra=ra_deg, dec=dec_deg, unit=u.deg)))
+                return self._result_queue.get()
+
+    @Pyro4.expose
+    def zero(self):
+        """Sync the telescope position on the zero markers"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            with self._state_lock:
+                if self._current_state is None:
+                    return CommandStatus.NotConnected
+
+            with self._comm_lock:
+                self._command_queue.put(('zero', None))
+                return self._result_queue.get()
+
+    @Pyro4.expose
+    def park(self, position):
+        """Moves the telescope to a named park position (but does not disconnect)"""
+
+        park = self._config.park_positions.get(position, None)
+        if park is None:
+            return CommandStatus.UnknownParkPosition
+
+        coords = SkyCoord(
+            alt=park['alt'],
+            az=park['az'],
+            unit=u.deg,
+            frame='altaz',
+            location=self._location,
+            obstime=Time.now())
+
+        return self._point(coords, False)
+
+    @Pyro4.expose
+    def train_ra_pec(self, enable):
+        """Enables or disables the periodic error correction training mode for the RA axis"""
+        # TODO
+        return CommandStatus.Failed
+
+    @Pyro4.expose
+    def shutdown(self):
+        """Disables motor power and disconnects from mount"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            with self._comm_lock:
+                self._command_queue.put(('shutdown', None))
+                return self._result_queue.get()
+
+    @Pyro4.expose
+    def ping(self):
+        """Returns immediately with a success status"""
+        return CommandStatus.Succeeded
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Telescope Server')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+    c = Config(args.config)
+    c.daemon.launch(MeadeDaemon(c))
