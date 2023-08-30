@@ -275,6 +275,7 @@ class MeadeDaemon:
                 # Reported RA,Dec are incorrect when slewing, so calculate from Alt, Az
                 coords_j2000 = SkyCoord(alt=alt, az=az, unit=u.deg, frame='altaz',
                                         location=self._location, obstime=update_time).icrs
+                coords_jnow = coords_j2000.transform_to(FK5(equinox=update_time))
             else:
                 alignment = command_with_response(self._port, 'GW', 3)
                 state = TelescopeState.Tracking if alignment[1:2] == b'T' else TelescopeState.Stopped
@@ -289,6 +290,7 @@ class MeadeDaemon:
                 'state_label': TelescopeState.label(state),
                 'lst': lst,
                 'ra': coords_j2000.ra.to_value(u.deg),
+                'ha': lst - coords_jnow.ra.to_value(u.deg),
                 'dec': coords_j2000.dec.to_value(u.deg),
                 'alt': alt,
                 'az': az,
@@ -296,12 +298,9 @@ class MeadeDaemon:
                 'site_latitude': self._location.lat.to_value(u.deg),
                 'site_longitude': self._location.lon.to_value(u.deg),
                 'site_elevation': self._location.height.to_value(u.m),
-            }
-
-            data.update({
                 'moon_separation': get_moon(update_time).separation(coords_j2000).to_value(u.deg),
                 'sun_separation': get_sun(update_time).separation(coords_j2000).to_value(u.deg),
-            })
+            }
 
         with self._state_lock:
             was_slewing = False
