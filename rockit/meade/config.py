@@ -42,6 +42,11 @@ CONFIG_SCHEMA = {
                 'machine_name': True
             }
         },
+        # optional
+        'dome_daemon': {
+            'type': 'string',
+            'daemon_name': True
+        },
         'serial_port': {
             'type': 'string',
         },
@@ -146,6 +151,11 @@ class Config:
         self.daemon = getattr(daemons, config_json['daemon'])
         self.log_name = config_json['log_name']
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
+
+        self.dome_daemon = None
+        if 'dome_daemon' in config_json:
+            self.dome_daemon = getattr(daemons, config_json['dome_daemon'])
+
         self.serial_port = config_json['serial_port']
         self.serial_baud = int(config_json['serial_baud'])
         self.serial_timeout = int(config_json['serial_timeout'])

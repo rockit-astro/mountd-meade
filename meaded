@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import traceback
-from astropy.coordinates import Angle, FK5, ICRS, SkyCoord, EarthLocation, get_moon, get_sun
+from astropy.coordinates import AltAz, Angle, FK5, ICRS, SkyCoord, EarthLocation, get_moon, get_sun
 from astropy.time import Time
 import astropy.units as u
 import serial
@@ -322,10 +322,19 @@ class MeadeDaemon:
             return CommandStatus.NotConnected
 
         if request == 'stop':
+            if self._config.dome_daemon:
+                try:
+                    with self._config.dome_daemon.connect() as ops:
+                        ops.notify_telescope_stopped()
+                except Exception as e:
+                    log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                    sys.stdout.flush()
+
             self._force_stopped = True
             command_without_response(self._port, 'Q')
             time.sleep(1)
             self._set_tracking(False)
+
             with self._move_complete_condition:
                 self._move_complete_condition.notify_all()
 
@@ -333,6 +342,14 @@ class MeadeDaemon:
             coords = data.transform_to(FK5(equinox=data.obstime))
             ra = coords.ra.to(u.hourangle).to_string(sep=":", precision=0, pad=True)
             dec = coords.dec.to(u.deg).to_string(sep="*:", precision=0, alwayssign=True, pad=True)
+
+            if self._config.dome_daemon:
+                try:
+                    with self._config.dome_daemon.connect() as ops:
+                        ops.notify_telescope_radec(data.ra.to_value(u.deg), data.dec.to_value(u.deg), True)
+                except Exception as e:
+                    log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                    sys.stdout.flush()
 
             if not command_with_bool_response(self._port, f'Sr{ra}'):
                 return CommandStatus.Failed
@@ -361,6 +378,17 @@ class MeadeDaemon:
 
             az_deg = int(az)
             az_min = int(60*(az - az_deg))
+
+            if self._config.dome_daemon:
+                try:
+                    with self._config.dome_daemon.connect() as ops:
+                        if isinstance(data.frame, AltAz):
+                            ops.notify_telescope_altaz(data.alt.to_value(u.deg), data.az.to_value(u.deg))
+                        else:
+                            ops.notify_telescope_radec(data.ra.to_value(u.deg), data.dec.to_value(u.deg), False)
+                except Exception as e:
+                    log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                    sys.stdout.flush()
 
             if not command_with_bool_response(self._port, f'Sa{alt}'):
                 return CommandStatus.Failed
