@@ -3,7 +3,7 @@
   "log_name": "meaded@warwick",
   "control_machines": ["LocalHost"],
   "dome_daemon": "warwick_dome",
-  "serial_port": "/dev/ttyUSB0",
+  "serial_port": "/dev/ttyS0",
   "serial_baud": 9600,
   "serial_timeout": 3,
   "latitude": 52.376861,
