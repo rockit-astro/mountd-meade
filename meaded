@@ -364,7 +364,7 @@ class MeadeDaemon:
                 return CommandStatus.Failed
 
             return CommandStatus.Succeeded
-        elif request == 'slew':
+        elif request in ['slew', 'park']:
             # 'MA' command assumes that the telescope is mounted altaz
             # For an equatorial mount this maps from
             #    Altitude -> Dec
@@ -382,7 +382,9 @@ class MeadeDaemon:
             if self._config.dome_daemon:
                 try:
                     with self._config.dome_daemon.connect() as ops:
-                        if isinstance(data.frame, AltAz):
+                        if request == 'park':
+                            ops.notify_telescope_parked()
+                        elif isinstance(data.frame, AltAz):
                             ops.notify_telescope_altaz(data.alt.to_value(u.deg), data.az.to_value(u.deg))
                         else:
                             ops.notify_telescope_radec(data.ra.to_value(u.deg), data.dec.to_value(u.deg), False)
@@ -558,7 +560,7 @@ class MeadeDaemon:
 
         return CommandStatus.Succeeded
 
-    def _point(self, coords, tracking=False):
+    def _point(self, coords, tracking=False, parking=False):
         """Moves the telescope to a specified SkyCoord and optionally begins tracking"""
 
         if not pyro_client_matches(self._config.control_ips):
@@ -573,7 +575,14 @@ class MeadeDaemon:
                     return CommandStatus.NotConnected
 
             with self._comm_lock:
-                self._command_queue.put(('track' if tracking else 'slew', coords))
+                if tracking:
+                    command = 'track'
+                elif parking:
+                    command = 'park'
+                else:
+                    command = 'slew'
+
+                self._command_queue.put((command, coords))
                 status = self._result_queue.get()
                 if status != CommandStatus.Succeeded:
                     return status
@@ -708,7 +717,7 @@ class MeadeDaemon:
             location=self._location,
             obstime=Time.now())
 
-        return self._point(coords, False)
+        return self._point(coords, parking=True)
 
     @Pyro4.expose
     def train_ra_pec(self, enable):
