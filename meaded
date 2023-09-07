@@ -404,6 +404,31 @@ class MeadeDaemon:
                 return CommandStatus.Failed
 
             return CommandStatus.Succeeded
+        elif request == 'offset_radec':
+            ra_delta_deg, dec_delta_deg = data
+
+            # Only support offsets less than an arcminute
+            # Larger offsets should issue a slew / track command
+            if abs(ra_delta_deg * 60) > 1 or abs(dec_delta_deg * 60) > 1:
+                return CommandStatus.Failed
+
+            # Set offset rate to 10 arcsec/sec
+            command_without_response(self._port, 'Rg10.0')
+            command_without_response(self._port, 'RG')
+
+            ra_millis = int(ra_delta_deg * 360000)
+            if ra_millis > 0:
+                command_without_response(self._port, f'Mge{ra_millis:04d}')
+            elif ra_millis < 0:
+                command_without_response(self._port, f'Mgw{-ra_millis:04d}')
+
+            dec_millis = int(dec_delta_deg * 360000)
+            if dec_millis > 0:
+                command_without_response(self._port, f'Mgn{dec_millis:04d}')
+            elif dec_millis < 0:
+                command_without_response(self._port, f'Mgs{-dec_millis:04d}')
+
+            return CommandStatus.Succeeded
         elif request == 'sync':
             coords = data.transform_to(FK5(equinox=data.obstime))
             ra = coords.ra.to(u.hourangle).to_string(sep=":", precision=0, pad=True)
@@ -629,8 +654,70 @@ class MeadeDaemon:
     @Pyro4.expose
     def offset_radec(self, ra_delta_deg, dec_delta_deg):
         """Offsets the telescope relative to the current position"""
-        # TODO
-        return CommandStatus.Failed
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            command = ('offset_radec', (ra_delta_deg, dec_delta_deg))
+            with self._state_lock:
+                if self._current_state is None:
+                    return CommandStatus.NotConnected
+
+                if abs(ra_delta_deg * 60) >= 1 or abs(dec_delta_deg * 60) >= 1:
+                    # Offsets of 1 arcmin or larger are treated as a regular slew
+                    if self._current_state['state'] == TelescopeState.Tracking:
+                        command = ('track', SkyCoord(
+                            ra=self._current_state['ra'] + ra_delta_deg,
+                            dec=self._current_state['dec'] + dec_delta_deg,
+                            unit=u.deg,
+                            frame='icrs',
+                            obstime=Time(Time.now(), location=self._location)))
+                    else:
+                        now = Time.now()
+                        coords = SkyCoord(
+                            alt=self._current_state['alt'],
+                            az=self._current_state['az'],
+                            unit=u.deg,
+                            frame='altaz',
+                            location=self._location,
+                            obstime=now).icrs
+                        command = ('slew', SkyCoord(
+                            ra=coords.ra + ra_delta_deg * u.deg,
+                            dec=coords.dec + dec_delta_deg * u.deg,
+                            frame='icrs',
+                            obstime=Time(now, location=self._location)))
+
+            with self._comm_lock:
+                self._command_queue.put(command)
+                status = self._result_queue.get()
+                if status != CommandStatus.Succeeded:
+                    return status
+
+            start = Time.now()
+            with self._move_complete_condition:
+                while True:
+                    # Note: it can take a second before the slew begins
+                    # Wait an interval period so we don't exit too early
+                    self._move_complete_condition.wait(self._config.slew_loop_delay)
+
+                    if self._force_stopped:
+                        break
+
+                    with self._state_lock:
+                        if self._current_state.get('state', TelescopeState.Disabled) != TelescopeState.Slewing:
+                            break
+
+                    if (Time.now() - start).to_value(u.s) > self._config.slew_timeout:
+                        break
+
+                if self._force_stopped:
+                    log.error(self._config.log_name, 'Pointing failed: aborted')
+                    return CommandStatus.Failed
+
+                return CommandStatus.Succeeded
 
     @Pyro4.expose
     def slew_radec(self, ra_deg, dec_deg):
