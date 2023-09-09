@@ -190,7 +190,6 @@ def status(config, _):
     print(f'   RA is {TFmt.Bold}{ra_desc}{TFmt.Clear}')
     print(f'   Dec is {TFmt.Bold}{dec_desc}{TFmt.Clear}')
     print(f'   Altitude is {TFmt.Bold}{data["alt"]:.1f}\u00B0{TFmt.Clear}')
-    print(f'   Altitude is {TFmt.Bold}{data["alt"]:.1f}\u00B0{TFmt.Clear}')
     print(f'   Azimuth is {TFmt.Bold}{data["az"]:.1f}\u00B0{TFmt.Clear}')
     print(f'   Moon separation is {TFmt.Bold}{data["moon_separation"]:.1f}\u00B0{TFmt.Clear}')
     print(f'   Sun separation is {TFmt.Bold}{data["sun_separation"]:.1f}\u00B0{TFmt.Clear}')
