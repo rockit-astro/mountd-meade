@@ -430,7 +430,7 @@ class MeadeDaemon:
 
             return CommandStatus.Succeeded
         elif request == 'sync':
-            coords = data.transform_to(FK5(equinox=data.obstime))
+            coords = data.transform_to(FK5(equinox=Time.now()))
             ra = coords.ra.to(u.hourangle).to_string(sep=":", precision=0, pad=True)
             dec = coords.dec.to(u.deg).to_string(sep="*:", precision=0, alwayssign=True, pad=True)
 
