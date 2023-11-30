@@ -1,7 +1,7 @@
 {
   "daemon": "warwick_telescope",
   "log_name": "meaded@warwick",
-  "control_machines": ["LocalHost"],
+  "control_machines": ["WarwickTCS"],
   "dome_daemon": "warwick_dome",
   "serial_port": "/dev/ttyS0",
   "serial_baud": 9600,
