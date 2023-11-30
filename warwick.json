@@ -13,7 +13,7 @@
   "slew_timeout": 90,
   "slew_loop_delay": 0.25,
   "idle_loop_delay": 1,
-  "ha_soft_limits": [-82, 82],
+  "ha_soft_limits": [-71, 71],
   "dec_soft_limits": [-20, 85],
   "park_positions": {
     "zenith": {
