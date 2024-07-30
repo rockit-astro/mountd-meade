@@ -157,7 +157,7 @@ class MeadeDaemon:
                 response = port.read(1)
                 if len(response) > 0:
                     if response not in [b'L', b'P']:
-                        raise serial.SerialException('Mount is not in Polar mode')
+                        raise ValueError('Mount is not in Polar mode')
                     break
 
                 if (Time.now() - initialize_start) > self._config.initialize_timeout * u.s:
