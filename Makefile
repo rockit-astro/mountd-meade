@@ -7,8 +7,8 @@ RPMBUILD = rpmbuild --define "_topdir %(pwd)/build" \
 all:
 	mkdir -p build
 	date --utc +%Y%m%d%H%M%S > VERSION
-	${RPMBUILD} --define "_version %(cat VERSION)" -ba rockit-meade.spec
-	${RPMBUILD} --define "_version %(cat VERSION)" -ba python3-rockit-meade.spec
+	${RPMBUILD} --define "_version %(cat VERSION)" -ba rockit-mount-meade.spec
+	${RPMBUILD} --define "_version %(cat VERSION)" -ba python3-rockit-mount-meade.spec
 
 	mv build/noarch/*.rpm .
 	rm -rf build VERSION
@@ -16,12 +16,12 @@ all:
 install:
 	@date --utc +%Y%m%d%H%M%S > VERSION
 	@python3 -m build --outdir .
-	@sudo pip3 install rockit.meade-$$(cat VERSION)-py3-none-any.whl
+	@sudo pip3 install rockit.mount.meade-$$(cat VERSION)-py3-none-any.whl
 	@rm VERSION
-	@sudo cp meaded tel /bin/
-	@sudo cp meaded@.service /usr/lib/systemd/system/
+	@sudo cp meade_mountd tel /bin/
+	@sudo cp meade_mountd@.service /usr/lib/systemd/system/
 	@sudo cp completion/tel /etc/bash_completion.d/
-	@sudo install -d /etc/meaded
+	@sudo install -d /etc/mountd
 	@echo ""
 	@echo "Installed server, client, and service files."
-	@echo "Now copy the relevant json config files to /etc/meaded/"
+	@echo "Now copy the relevant json config files to /etc/mountd/"

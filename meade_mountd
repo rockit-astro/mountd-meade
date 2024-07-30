@@ -32,7 +32,7 @@ import Pyro4
 
 from rockit.common import log, TryLock
 from rockit.common.helpers import pyro_client_matches
-from rockit.meade import CommandStatus, Config, TelescopeState
+from rockit.mount.meade import CommandStatus, Config, TelescopeState
 
 SEXAGESIMAL_REGEX = re.compile(rb'^(?P<unit>[+-]?\d+)(?P<type>[:\xDF])(?P<minutes>\d+):(?P<seconds>\d+)$')
 

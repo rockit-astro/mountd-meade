@@ -1,13 +1,13 @@
 ## Meade LX200-GPS mount daemon
 
-`meaded` interfaces with the mount over RS232 and exposes a
+`meade_mountd` interfaces with the mount over RS232 and exposes a
 coherent telescope control interface via Pyro.
 
 `tel` is a commandline utility for controlling the telescope.
 
 ### Configuration
 
-Configuration is read from json files that are installed by default to `/etc/meaded`.
+Configuration is read from json files that are installed by default to `/etc/mountd`.
 A configuration file is specified when launching the server, and the `tel` frontend will search this location when launched.
 
 ```python
@@ -43,7 +43,7 @@ The automated packaging scripts will push 3 RPM packages to the observatory pack
 
 | Package                   | Description                                                                  |
 |---------------------------|------------------------------------------------------------------------------|
-| rockit-meade-server       | Contains the `meaded` server and systemd service file.                       |
+| rockit-meade-server       | Contains the `meade_mountd` server and systemd service file.                 |
 | rockit-meade-client       | Contains the `tel` commandline utility for controlling the telescope server. |
 | rockit-meade-data-warwick | Contains the json configuration for the Windmill Hill telescope.             |
 | python3-rockit-meade      | Contains the python module with shared code.                                 |
@@ -51,7 +51,7 @@ The automated packaging scripts will push 3 RPM packages to the observatory pack
 After installing packages, the systemd service should be enabled:
 
 ```
-sudo systemctl enable --now meaded@<config>
+sudo systemctl enable --now meade_mountd@<config>
 ```
 
 where `config` is the name of the json file for the appropriate telescope.
@@ -74,13 +74,13 @@ sudo yum update
 
 The daemon should then be restarted to use the newly installed code:
 ```
-sudo systemctl restart meaded@<config>
+sudo systemctl restart meade_mountd@<config>
 ```
 
 ### Testing Locally
 
 The server and client can be run directly from a git clone:
 ```
-./meaded warwick.json
-MEADED_CONFIG_PATH=./warwick.json ./tel status
+./meade_mountd warwick.json
+MOUNTD_CONFIG_PATH=./warwick.json ./tel status
 ```
