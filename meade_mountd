@@ -153,6 +153,8 @@ class MeadeDaemon:
             initialize_start = Time.now()
 
             while True:
+                port.flushInput()
+                port.flushOutput()
                 port.write(b'\x06')
                 response = port.read(1)
                 if len(response) > 0:
@@ -184,6 +186,15 @@ class MeadeDaemon:
             ret = command_with_bool_response(port, f'hI{Time.now().strftime("%y%m%d%H%M%S")}')
             if not ret:
                 raise serial.SerialException('Failed to set current time')
+
+            print('Waiting for mount to home')
+            while True:
+                if (Time.now() - initialize_start) > self._config.initialize_timeout * u.s:
+                    raise serial.SerialException('Mount initialization timed out')
+
+                if b'Finding Home' not in command_with_string_response(port, 'ED'):
+                    break
+                time.sleep(5)
 
             # Validate site location and time
             latitude = sexagesimal_to_degrees(command_with_string_response(port, 'Gt'))
@@ -264,8 +275,13 @@ class MeadeDaemon:
         state = TelescopeState.Disabled
         if self._port is not None:
             update_time = Time.now()
+            while True:
+                alt_str = command_with_string_response(self._port, 'GA')
+                if alt_str:
+                    break
+                time.sleep(1)
 
-            alt = sexagesimal_to_degrees(command_with_string_response(self._port, 'GA'))
+            alt = sexagesimal_to_degrees(alt_str)
             az = sexagesimal_to_degrees(command_with_string_response(self._port, 'GZ'))
             lst = sexagesimal_to_degrees(command_with_string_response(self._port, 'GS'))
 
@@ -279,7 +295,12 @@ class MeadeDaemon:
             else:
                 alignment = command_with_response(self._port, 'GW', 3)
                 state = TelescopeState.Tracking if alignment[1:2] == b'T' else TelescopeState.Stopped
-                ra_jnow = sexagesimal_to_degrees(command_with_string_response(self._port, 'GR'))
+                while True:
+                    ra_str = command_with_string_response(self._port, 'GR')
+                    if ra_str:
+                        break
+                    time.sleep(1)
+                ra_jnow = sexagesimal_to_degrees(ra_str)
                 dec_jnow = sexagesimal_to_degrees(command_with_string_response(self._port, 'GD'))
                 coords_jnow = SkyCoord(ra=ra_jnow, dec=dec_jnow, unit=u.deg, frame=FK5(equinox=update_time))
                 coords_j2000 = coords_jnow.transform_to(ICRS)
