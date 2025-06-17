@@ -1,6 +1,6 @@
 Name:      rockit-mount-meade
 Version:   %{_version}
-Release:   1
+Release:   1%{dist}
 Summary:   Meade LX200-GPS mount control
 Url:       https://github.com/rockit-astro/mountd-meade
 License:   GPL-3.0
