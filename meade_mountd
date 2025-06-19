@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import traceback
-from astropy.coordinates import AltAz, Angle, FK5, ICRS, SkyCoord, EarthLocation, get_moon, get_sun
+from astropy.coordinates import AltAz, Angle, FK5, ICRS, SkyCoord, EarthLocation, get_body
 from astropy.time import Time
 import astropy.units as u
 import serial
@@ -319,8 +319,8 @@ class MeadeDaemon:
                 'site_latitude': self._location.lat.to_value(u.deg),
                 'site_longitude': self._location.lon.to_value(u.deg),
                 'site_elevation': self._location.height.to_value(u.m),
-                'moon_separation': get_moon(update_time).separation(coords_j2000).to_value(u.deg),
-                'sun_separation': get_sun(update_time).separation(coords_j2000).to_value(u.deg),
+                'moon_separation': get_body('moon', update_time).separation(coords_j2000).to_value(u.deg),
+                'sun_separation': get_body('sun', update_time).separation(coords_j2000).to_value(u.deg),
             }
 
         with self._state_lock:
